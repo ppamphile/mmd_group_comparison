@@ -21,8 +21,6 @@ Ce module :
    - Imputation_log
    - Parametres_cleaning
 
-Ce fichier est un module de travail réutilisable.
-Il ne doit pas être exécuté directement.
 """
 
 from dataclasses import dataclass
@@ -50,6 +48,7 @@ class PreCleaningConfig:
 
     # Stratégie d'imputation sur les variables actives conservées
     missing_strategy: str = "median"   # "median", "mean", "mode"
+    imputation_scope: str = "group"      # "group" ou "global"
 
     # Nombre minimal d'items par bloc actif après nettoyage
     min_items_per_block: int = 1
@@ -123,6 +122,21 @@ def impute_series(s: pd.Series, strategy: str) -> pd.Series:
     return s.fillna(value)
 
 
+def imputation_value(s: pd.Series, strategy: str):
+    """Valeur effectivement utilisée par impute_series, pour le journal."""
+    if strategy not in {"median", "mean", "mode"}:
+        raise ValueError("missing_strategy doit être 'median', 'mean' ou 'mode'.")
+    if pd.api.types.is_numeric_dtype(s) and not is_binary_numeric(s):
+        if strategy == "median":
+            return s.median()
+        if strategy == "mean":
+            return s.mean()
+        mode = s.mode(dropna=True)
+        return mode.iloc[0] if len(mode) else 0
+    mode = s.mode(dropna=True)
+    return mode.iloc[0] if len(mode) else "Non renseigné"
+
+
 def build_output_path(excel_path: str) -> Path:
     """
     Construit le nom du fichier de sortie.
@@ -184,6 +198,8 @@ def pre_clean_excel(config: PreCleaningConfig) -> Dict[str, pd.DataFrame]:
     """
     Pré-nettoie les feuilles Data et Structure_Items.
     """
+    if config.imputation_scope not in {"group", "global"}:
+        raise ValueError("imputation_scope doit être 'group' ou 'global'.")
 
     # ---------------------------------------------
     # 1. Lecture des feuilles
@@ -319,32 +335,37 @@ def pre_clean_excel(config: PreCleaningConfig) -> Dict[str, pd.DataFrame]:
     imputation_log = []
 
     for col in final_active_columns:
-        n_missing_before = int(df_work[col].isna().sum())
+        if config.imputation_scope == "group":
+            subsets = ((group, indices) for group, indices in
+                       df_work.groupby(group_col, sort=False).groups.items())
+        else:
+            subsets = (("Tous groupes", df_work.index),)
 
-        if n_missing_before > 0:
-            before = df_work[col].copy()
-            df_work[col] = impute_series(df_work[col], config.missing_strategy)
-
-            if pd.api.types.is_numeric_dtype(before) and not is_binary_numeric(before):
-                if config.missing_strategy == "median":
-                    value = before.median()
-                elif config.missing_strategy == "mean":
-                    value = before.mean()
-                else:
-                    mode = before.mode(dropna=True)
-                    value = mode.iloc[0] if len(mode) > 0 else None
-            else:
-                mode = before.mode(dropna=True)
-                value = mode.iloc[0] if len(mode) > 0 else "Non renseigné"
-
+        for group, indices in subsets:
+            before = df_work.loc[indices, col].copy()
+            n_missing = int(before.isna().sum())
+            if not n_missing:
+                continue
+            if before.notna().sum() == 0:
+                raise ValueError(
+                    f"Impossible d'imputer '{col}' dans le groupe '{group}' : "
+                    "aucune valeur observée."
+                )
+            value = imputation_value(before, config.missing_strategy)
+            df_work.loc[indices, col] = impute_series(before, config.missing_strategy)
             imputation_log.append({
                 "variable": col,
-                "n_imputes": n_missing_before,
+                "groupe": group,
+                "n_imputes": n_missing,
+                "n_observes": int(before.notna().sum()),
                 "strategie": config.missing_strategy,
-                "valeur_imputation": value
+                "valeur_imputation": value,
             })
 
-    imputation_log_df = pd.DataFrame(imputation_log)
+    imputation_log_df = pd.DataFrame(imputation_log, columns=[
+        "variable", "groupe", "n_imputes", "n_observes",
+        "strategie", "valeur_imputation",
+    ])
 
     # ---------------------------------------------
     # 9. Construction des sorties
@@ -386,6 +407,7 @@ def pre_clean_excel(config: PreCleaningConfig) -> Dict[str, pd.DataFrame]:
             "etape": "imputation_finale",
             "n_variables_imputees": len(imputation_log_df),
             "strategie_imputation": config.missing_strategy,
+            "perimetre_imputation": config.imputation_scope,
         }
     ]
     rapport_cleaning = pd.DataFrame(report_rows)
@@ -421,6 +443,11 @@ def pre_clean_excel(config: PreCleaningConfig) -> Dict[str, pd.DataFrame]:
             "parametre": "missing_strategy",
             "valeur": config.missing_strategy,
             "justification": "Imputation finale des NA restants"
+        },
+        {
+            "parametre": "imputation_scope",
+            "valeur": config.imputation_scope,
+            "justification": "Imputation par groupe ou sur toutes les observations"
         },
         {
             "parametre": "min_items_per_block",
@@ -477,6 +504,7 @@ def run_cleaning(
     max_missing_prop_rows: float = 0.20,
     missing_strategy: str = "median",
     min_items_per_block: int = 1,
+    imputation_scope: str = "group",
 ):
     """
     Lance le pré-nettoyage depuis un script externe.
@@ -504,6 +532,7 @@ def run_cleaning(
         max_missing_prop_rows=max_missing_prop_rows,
         missing_strategy=missing_strategy,
         min_items_per_block=min_items_per_block,
+        imputation_scope=imputation_scope,
     )
 
     results = pre_clean_excel(config)
